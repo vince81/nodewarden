@@ -1,5 +1,4 @@
 import { LIMITS } from './config/limits';
-import { DEFAULT_DEV_SECRET } from './types';
 import {
   handleAccessSend,
   handleAccessSendFile,
@@ -8,6 +7,11 @@ import {
   handleDownloadSendFile,
 } from './handlers/sends';
 import { handleKnownDevice } from './handlers/devices';
+import {
+  handleDigitalAssetLinkCheck,
+  handleFillAssistForms,
+  handleFillAssistManifest,
+} from './handlers/fill-assist';
 import { handleToken, handlePrelogin, handleRevocation } from './handlers/identity';
 import { handleGetAccountPasskeyAssertionOptions } from './handlers/account-passkeys';
 import {
@@ -28,18 +32,26 @@ import {
 } from './handlers/notifications';
 import { handlePublicUploadSendFile } from './handlers/sends';
 import { isSafeWebsiteIconContentType } from './utils/content-type';
-import { jsonResponse } from './utils/response';
+import { jsonResponse, unsupportedResponse } from './utils/response';
 import { StorageService } from './services/storage';
 import type { Env } from './types';
+import { getConfiguredWebAuthnAllowedOrigins } from './utils/origins';
+import { buildConfigResponse } from './config-response';
 
 type PublicRateLimiter = (category?: string, maxRequests?: number) => Promise<Response | null>;
-type JwtUnsafeReason = 'missing' | 'default' | 'too_short' | null;
+type JwtUnsafeReason = 'missing' | 'too_short' | null;
 
 export interface WebBootstrapResponse {
   defaultKdfIterations: number;
   jwtUnsafeReason: JwtUnsafeReason;
   jwtSecretMinLength: number;
   registrationInviteRequired: boolean;
+  webAuthnAllowedOrigins: string[];
+  websiteIconsEnabled: boolean;
+}
+
+function isWebsiteIconProxyEnabled(env: Env): boolean {
+  return true;
 }
 
 function isSameOriginWriteRequest(request: Request): boolean {
@@ -82,56 +94,6 @@ function handleMissingWebsiteIcon(): Response {
       'Cache-Control': 'public, max-age=300',
     },
   });
-}
-
-function buildIconServiceBase(origin: string): string {
-  return `${origin}/icons`;
-}
-
-function buildIconServiceTemplate(origin: string): string {
-  return `${buildIconServiceBase(origin)}/{}/icon.png`;
-}
-
-function buildIconServiceCsp(origin: string): string {
-  return `img-src 'self' data: ${origin}`;
-}
-
-function buildConfigResponse(origin: string) {
-  return {
-    version: LIMITS.compatibility.bitwardenServerVersion,
-    gitHash: 'nodewarden',
-    server: null,
-    environment: {
-      cloudRegion: 'self-hosted',
-      vault: origin,
-      api: origin + '/api',
-      identity: origin + '/identity',
-      notifications: origin + '/notifications',
-      icons: origin,
-      sso: '',
-      fillAssistRules: null,
-    },
-    push: {
-      pushTechnology: 0,
-      vapidPublicKey: null,
-    },
-    communication: null,
-    settings: {
-      disableUserRegistration: false,
-    },
-    _icon_service_url: buildIconServiceTemplate(origin),
-    _icon_service_csp: buildIconServiceCsp(origin),
-    featureStates: {
-      'cipher-key-encryption': LIMITS.compatibility.cipherKeyEncryptionFeatureEnabled,
-      'duo-redirect': true,
-      'email-verification': true,
-      'pm-19051-send-email-verification': false,
-      'pm-19148-innovation-archive': true,
-      'unauth-ui-refresh': true,
-      'web-push': false,
-    },
-    object: 'config',
-  };
 }
 
 function normalizeIconHost(rawHost: string): string | null {
@@ -247,7 +209,11 @@ function iconResponse(body: BodyInit | null, contentType: string | null): Respon
   });
 }
 
-async function handleWebsiteIcon(host: string, fallbackMode: 'default' | 'not-found' = 'default'): Promise<Response> {
+async function handleWebsiteIcon(env: Env, host: string, fallbackMode: 'default' | 'not-found' = 'default'): Promise<Response> {
+  if (!isWebsiteIconProxyEnabled(env)) {
+    return fallbackMode === 'not-found' ? handleMissingWebsiteIcon() : handleNwFavicon();
+  }
+
   const normalizedHost = normalizeIconHost(host);
   if (!normalizedHost) return fallbackMode === 'not-found' ? handleMissingWebsiteIcon() : handleNwFavicon();
 
@@ -303,9 +269,7 @@ export async function buildWebBootstrapResponse(env: Env): Promise<WebBootstrapR
   const jwtUnsafeReason =
     !secret
       ? 'missing'
-      : secret === DEFAULT_DEV_SECRET
-        ? 'default'
-        : secret.length < LIMITS.auth.jwtSecretMinLength
+      : secret.length < LIMITS.auth.jwtSecretMinLength
           ? 'too_short'
           : null;
   const storage = new StorageService(env.DB);
@@ -316,6 +280,8 @@ export async function buildWebBootstrapResponse(env: Env): Promise<WebBootstrapR
     jwtUnsafeReason,
     jwtSecretMinLength: LIMITS.auth.jwtSecretMinLength,
     registrationInviteRequired: userCount > 0,
+    webAuthnAllowedOrigins: getConfiguredWebAuthnAllowedOrigins(env),
+    websiteIconsEnabled: isWebsiteIconProxyEnabled(env),
   };
 }
 
@@ -342,12 +308,31 @@ export async function handlePublicRoute(
     return jsonResponse(await buildWebBootstrapResponse(env));
   }
 
+  if (path === '/fill-assist/manifest.json' && method === 'GET') {
+    const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+    if (blocked) return blocked;
+    return handleFillAssistManifest();
+  }
+
+  if ((path === '/v1/assetlinks:check' || path === '/api/v1/assetlinks:check') && method === 'GET') {
+    const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+    if (blocked) return blocked;
+    return handleDigitalAssetLinkCheck();
+  }
+
+  const fillAssistFormsMatch = path.match(/^\/fill-assist\/([^/]+)$/i);
+  if (fillAssistFormsMatch && method === 'GET') {
+    const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+    if (blocked) return blocked;
+    return handleFillAssistForms(fillAssistFormsMatch[1]);
+  }
+
   const iconMatch = path.match(/^\/icons\/([^/]+)\/icon\.png$/i);
   if (iconMatch && method === 'GET') {
     const blocked = await enforcePublicRateLimit('public-icon', LIMITS.rateLimit.publicIconRequestsPerMinute);
     if (blocked) return blocked;
     const fallbackMode = new URL(request.url).searchParams.get('fallback') === '404' ? 'not-found' : 'default';
-    return handleWebsiteIcon(iconMatch[1], fallbackMode);
+    return handleWebsiteIcon(env, iconMatch[1], fallbackMode);
   }
 
   const publicAttachmentMatch = path.match(/^\/api\/attachments\/([a-f0-9-]+)\/([a-f0-9-]+)$/i);
@@ -397,13 +382,13 @@ export async function handlePublicRoute(
     return handleDownloadSendFile(request, env, sendDownloadMatch[1], sendDownloadMatch[2]);
   }
 
-  if ((path === '/api/auth-requests' || path === '/api/auth-requests/') && method === 'POST') {
+  if ((path === '/api/auth-requests' || path === '/api/auth-requests/' || path === '/auth-requests' || path === '/auth-requests/') && method === 'POST') {
     const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
     if (blocked) return blocked;
     return handleCreateAuthRequest(request, env);
   }
 
-  const authRequestResponseMatch = path.match(/^\/api\/auth-requests\/([a-f0-9-]+)\/response$/i);
+  const authRequestResponseMatch = path.match(/^\/(?:api\/)?auth-requests\/([a-f0-9-]+)\/response$/i);
   if (authRequestResponseMatch && method === 'GET') {
     const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
     if (blocked) return blocked;
@@ -450,7 +435,32 @@ export async function handlePublicRoute(
   }
 
   if ((path === '/identity/accounts/recover-2fa' || path === '/api/accounts/recover-2fa') && method === 'POST') {
+    const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+    if (blocked) return blocked;
     return handleRecoverTwoFactor(request, env);
+  }
+
+  const publicMailBackedPaths = new Set([
+    '/api/accounts/resend-new-device-otp',
+    '/accounts/resend-new-device-otp',
+    '/api/accounts/register/send-verification-email',
+    '/accounts/register/send-verification-email',
+    '/identity/accounts/register/send-verification-email',
+    '/api/accounts/register/verification-email-clicked',
+    '/accounts/register/verification-email-clicked',
+    '/identity/accounts/register/verification-email-clicked',
+    '/api/accounts/register/finish',
+    '/accounts/register/finish',
+    '/identity/accounts/register/finish',
+    '/api/accounts/verify-email-token',
+    '/accounts/verify-email-token',
+    '/api/two-factor/send-email-login',
+    '/two-factor/send-email-login',
+  ]);
+  if (publicMailBackedPaths.has(path) && method === 'POST') {
+    const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+    if (blocked) return blocked;
+    return unsupportedResponse('Email delivery is not supported by this server.');
   }
 
   if (path === '/api/accounts/password-hint' && method === 'POST') {
@@ -469,7 +479,7 @@ export async function handlePublicRoute(
     const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
     if (blocked) return blocked;
     const origin = new URL(request.url).origin;
-    return jsonResponse(buildConfigResponse(origin));
+    return jsonResponse(buildConfigResponse(origin), 200, { 'Cache-Control': 'no-store' });
   }
 
   if (path === '/api/version' && method === 'GET') {
@@ -499,6 +509,8 @@ export async function handlePublicRoute(
   }
 
   if (path === '/notifications/anonymous-hub' && method === 'GET') {
+    const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+    if (blocked) return blocked;
     return handleAnonymousNotificationsHub(request, env);
   }
   return null;
